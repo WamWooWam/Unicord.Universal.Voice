@@ -1,0 +1,9 @@
+import "VoiceClientOptions.idl";
+
+namespace Unicord.Universal.Voice {
+    [default_interface] runtimeclass VideoSurfaceCreatedEventArgs {
+        UInt32 UserId { get; };
+        UInt32 SSRC { get; };
+        Windows.Graphics.DirectX.Direct3D11.IDirect3DSurface Surface { get; };
+    };
+}

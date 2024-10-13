@@ -13,6 +13,10 @@
 #include <string>
 #include <thread>
 
+#include <dxgi.h>
+#include <dxgi1_2.h>
+#include <d3d11.h>
+
 #include "VoiceClient.g.h"
 
 #include "AudioFormat.h"
@@ -25,26 +29,41 @@
 #include "SpeakingAudioAnalyzer.h"
 #include "Rtp.h"
 
+#include <api/video/i420_buffer.h>
+#include <api/video/video_frame.h>
+#include <api/video/video_source_interface.h>
 #include <api/audio_codecs/builtin_audio_decoder_factory.h>
 #include <api/audio_codecs/builtin_audio_encoder_factory.h>
 #include <api/video_codecs/video_decoder_factory.h>
 #include <api/video_codecs/video_encoder_factory.h>
+#include <api/video_codecs/video_encoder.h>
+#include <api/video_codecs/video_decoder.h>
+#include <api/video_codecs/builtin_video_encoder_factory.h>
+#include <api/video_codecs/builtin_video_decoder_factory.h>
+#include <api/video/video_bitrate_allocator_factory.h>
 #include <call/call.h>
 
 #include <common_audio/include/audio_util.h>
 
 #include <media/engine/adm_helpers.h>
 #include <media/engine/webrtcvoiceengine.h>
+#include <media/engine/webrtcvideoengine.h>
+#include <media/engine/convert_legacy_video_factory.h>
 
 #include <modules/audio_mixer/audio_mixer_impl.h>
 #include <modules/audio_processing/audio_buffer.h>
 #include <modules/audio_processing/include/audio_processing.h>
 #include <modules/rtp_rtcp/include/rtp_header_parser.h>
 
+#include <modules/video_capture/video_capture_factory.h>
+#include <modules/video_capture/windows/device_info_mf.h>
+#include <test/frame_generator_capturer.h>
+
 #include <third_party/winuwp_h264/winuwp_h264_factory.h>
 
 #include "external/AudioDeviceWasapi.h"
 #include "external/IAudioDeviceWasapi.h"
+#include "external/VideoRenderer.h"
 
 using namespace winrt::Windows::Data::Json;
 using namespace winrt::Windows::Storage::Streams;
@@ -53,6 +72,24 @@ using namespace winrt::Windows::Networking::Sockets;
 using namespace winrt::Unicord::Universal::Voice::Interop;
 using namespace winrt::Unicord::Universal::Voice::Render;
 using namespace winrt::Unicord::Universal::Voice::Transport;
+
+struct StreamResolution {
+    uint32_t width;
+    uint32_t height;
+    std::string type;
+};
+
+struct StreamInfo {
+    std::string type;
+    uint32_t ssrc;
+    uint32_t rtx_ssrc;
+    uint32_t quality;
+    bool active;
+
+    StreamResolution max_resolution;
+    uint32_t max_bitrate;
+    uint32_t max_framerate;
+};
 
 namespace winrt::Unicord::Universal::Voice::implementation {
     struct VoiceClient : VoiceClientT<VoiceClient> {
@@ -69,8 +106,15 @@ namespace winrt::Unicord::Universal::Voice::implementation {
         rtc::scoped_refptr<webrtc::AudioEncoderFactory> _audioEncoderFactory = nullptr;
         rtc::scoped_refptr<webrtc::AudioDecoderFactory> _audioDecoderFactory = nullptr;
 
-        std::shared_ptr<webrtc::WinUWPH264EncoderFactory> _videoEncoderFactory = nullptr;
+        /*
+		std::shared_ptr<webrtc::WinUWPH264EncoderFactory> _videoEncoderFactory = nullptr;
         std::shared_ptr<webrtc::WinUWPH264DecoderFactory> _videoDecoderFactory = nullptr;
+		*/
+
+        std::unique_ptr<webrtc::VideoEncoderFactory> _videoEncoderFactory = nullptr;
+        std::unique_ptr<webrtc::VideoDecoderFactory> _videoDecoderFactory = nullptr;
+
+        std::unique_ptr<webrtc::VideoBitrateAllocatorFactory> _bitrateAllocatorFactory = nullptr;
 
         webrtc::AudioSendStream* _audioSendStream = nullptr;      // i dont like this rawptr
         webrtc::AudioDeviceWasapi* _audioDeviceManager = nullptr; // nor this one
@@ -81,6 +125,8 @@ namespace winrt::Unicord::Universal::Voice::implementation {
 
         webrtc::AudioSendStream* CreateAudioSendStream(uint32_t ssrc, uint8_t payloadType);
         webrtc::AudioReceiveStream* CreateAudioRecieveStream(uint32_t remoteSsrc, uint8_t payloadType);
+
+        webrtc::VideoSendStream* CreateVideoSendStream(uint32_t ssrc, uint32_t rtx_ssrc, std::string payloadName, uint8_t payloadType, uint8_t rtxPayloadType);
 
         static hstring OpusVersion();
         static hstring SodiumVersion();
@@ -94,11 +140,17 @@ namespace winrt::Unicord::Universal::Voice::implementation {
         winrt::event_token UdpSocketPingUpdated(Windows::Foundation::EventHandler<uint32_t> const& handler);
         void UdpSocketPingUpdated(winrt::event_token const& token) noexcept;
 
+        winrt::event_token VideoSurfaceCreated(Windows::Foundation::TypedEventHandler<Unicord::Universal::Voice::VoiceClient, Unicord::Universal::Voice::VideoSurfaceCreatedEventArgs> const& handler);
+        void VideoSurfaceCreated(winrt::event_token const& token) noexcept;
+
         winrt::Windows::Foundation::IAsyncAction ConnectAsync();
         winrt::fire_and_forget SendSpeakingAsync(bool speaking);
+        Windows::Foundation::IAsyncAction SendStreamsUpdateAsync();
         void UpdateAudioDevices();
         void UpdateMutedDeafened();
         void Close();
+
+        void EnableVideoStreams();
 
         bool Muted();
         void Muted(bool value);
@@ -114,6 +166,16 @@ namespace winrt::Unicord::Universal::Voice::implementation {
         ThreadPoolTimer _heartbeatTimer{ nullptr };
         ThreadPoolTimer _keepaliveTimer{ nullptr };
         DataWriter _udpWriter{ nullptr };
+
+        winrt::event<Windows::Foundation::EventHandler<uint32_t>> wsPingUpdated;
+        winrt::event<Windows::Foundation::EventHandler<uint32_t>> udpPingUpdated;
+        winrt::event<Windows::Foundation::TypedEventHandler<Unicord::Universal::Voice::VoiceClient, Unicord::Universal::Voice::VideoSurfaceCreatedEventArgs>> videoSurfaceCreated;
+
+        winrt::com_ptr<IDXGIDevice2> _dxgiDevice;
+		winrt::com_ptr<IDXGIFactory> _dxgiFactory;
+        winrt::com_ptr<IDXGIAdapter> _dxgiAdapter;
+		winrt::com_ptr<ID3D11Device> _d3d11Device;
+        winrt::com_ptr<ID3D11DeviceContext> _d3d11DeviceContext;
 
         std::mutex startMutex;
         std::shared_ptr<SodiumWrapper> _sodium = nullptr;
@@ -134,17 +196,21 @@ namespace winrt::Unicord::Universal::Voice::implementation {
         uint32_t heartbeat_interval = 0;
         uint32_t connection_stage = 0;
 
+        uint32_t _activeVideoSSRC = 0;
+        uint32_t _activeVideoRtxSSRC = 0;
+
+        concurrency::concurrent_unordered_map<std::string, StreamInfo> _streamMap;
+
         volatile uint32_t ws_ping = 0;
         volatile uint32_t last_heartbeat = 0;
-        winrt::event<Windows::Foundation::EventHandler<uint32_t>> wsPingUpdated;
 
         volatile uint32_t udp_ping = 0;
         volatile uint64_t keepalive_count = 0;
-        winrt::event<Windows::Foundation::EventHandler<uint32_t>> udpPingUpdated;
         concurrency::concurrent_unordered_map<uint64_t, uint64_t> keepalive_timestamps;
 
         bool is_disposed = false;
 
+		void InitialiseDirect3D();
         void InitialiseSockets();
         winrt::Windows::Foundation::IAsyncAction SendIdentifyAsync();
         winrt::Windows::Foundation::IAsyncAction SendJsonPayloadAsync(JsonObject& payload);

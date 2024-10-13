@@ -11,9 +11,9 @@ namespace winrt::Unicord::Universal::Voice::Transport {
     bool VoiceOutboundTransport::SendRtp(const uint8_t* packet, size_t length, const webrtc::PacketOptions& options) {
         static const size_t RtpHeaderSize = 12;
 
-        if (!_isActive) {
+        /*if (!_isActive) {
             return true;
-        }
+        }*/
 
         size_t encrypted_size = _sodium->CalculateTargetSize(length);
         gsl::span<const uint8_t> packet_span(packet, length);
@@ -39,11 +39,11 @@ namespace winrt::Unicord::Universal::Voice::Transport {
         _writer.WriteBytes(new_packet);
         _writer.StoreAsync().get();
 
-        if (_stopping) {
+      /*  if (_stopping) {
             _stopping = false;
             _isActive = false;
         }
-
+*/
         return true;
     }
 

@@ -1,4 +1,5 @@
 import "VoiceClientOptions.idl";
+import "VideoSurfaceCreatedEventArgs.idl";
 
 namespace Unicord.Universal.Voice
 {
@@ -15,8 +16,12 @@ namespace Unicord.Universal.Voice
         event Windows.Foundation.EventHandler<UInt32> WebSocketPingUpdated;
         event Windows.Foundation.EventHandler<UInt32> UdpSocketPingUpdated;
 
+		event Windows.Foundation.TypedEventHandler<VoiceClient, VideoSurfaceCreatedEventArgs> VideoSurfaceCreated;
+
         Windows.Foundation.IAsyncAction ConnectAsync();
         void UpdateAudioDevices();
+
+		void EnableVideoStreams();
 
         Boolean Muted{ get; set; };
         Boolean Deafened{ get; set; };

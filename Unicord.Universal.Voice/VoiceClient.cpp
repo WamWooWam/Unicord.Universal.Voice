@@ -10,6 +10,20 @@ using namespace winrt::Windows::Networking::Sockets;
 using namespace winrt::Windows::Storage::Streams;
 using namespace winrt::Unicord::Universal::Voice::Interop;
 
+class debugStreambuf : public std::streambuf {
+public:
+    virtual int_type overflow(int_type c = EOF) {
+        if (c != EOF) {
+            TCHAR buf[] = { c, '\0' };
+            OutputDebugString(buf);
+        }
+        return c;
+    }
+};
+
+
+#define VP8 0
+
 namespace winrt::Unicord::Universal::Voice::implementation {
 
     static const webrtc::SdpAudioFormat kOpusFormat = { "opus", 48000, 2, { { "stereo", "1" }, { "usedtx", "1" }, { "useinbandfec", "1" } } };
@@ -28,6 +42,8 @@ namespace winrt::Unicord::Universal::Voice::implementation {
     }
 
     VoiceClient::VoiceClient(VoiceClientOptions const& options) {
+        std::cout.rdbuf(new debugStreambuf());
+
         if (sodium_init() == -1) {
             throw hresult_error(E_UNEXPECTED, L"Failed to initialize libsodium!");
         }
@@ -37,6 +53,8 @@ namespace winrt::Unicord::Universal::Voice::implementation {
         }
 
         this->_voiceOptions = options;
+
+		InitialiseDirect3D();
 
         std::wstring_view raw_endpoint = options.Endpoint();
         std::size_t index = raw_endpoint.find_last_of(':');
@@ -78,10 +96,12 @@ namespace winrt::Unicord::Universal::Voice::implementation {
         udpPingUpdated.remove(token);
     }
 
-    Windows::Foundation::IAsyncAction VoiceClient::ConnectAsync() {
-        Windows::Foundation::Uri url{ L"wss://" + _webSocketEndpoint.hostname + L"/?encoding=json&v=5" };
-        co_await _webSocket.ConnectAsync(url);
-        _webSocketOpen = true;
+    winrt::event_token VoiceClient::VideoSurfaceCreated(Windows::Foundation::TypedEventHandler<Unicord::Universal::Voice::VoiceClient, Unicord::Universal::Voice::VideoSurfaceCreatedEventArgs> const& handler) {
+        return videoSurfaceCreated.add(handler);
+    }
+
+    void VoiceClient::VideoSurfaceCreated(winrt::event_token const& token) noexcept {
+        videoSurfaceCreated.remove(token);
     }
 
     bool VoiceClient::Muted() {
@@ -118,27 +138,83 @@ namespace winrt::Unicord::Universal::Voice::implementation {
         _webSocket.Closed({ this, &VoiceClient::OnWsClosed });
     }
 
+    void VoiceClient::InitialiseDirect3D() {
+        D3D_FEATURE_LEVEL featureLevels[] = { D3D_FEATURE_LEVEL_9_3 };
+
+        D3D_FEATURE_LEVEL featureLevel;
+        winrt::throw_hresult(
+            D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, featureLevels, 1, D3D11_SDK_VERSION, _d3d11Device.put(), &featureLevel, _d3d11DeviceContext.put()));
+
+        _dxgiDevice = _d3d11Device.as<IDXGIDevice2>();
+    }
+
+    Windows::Foundation::IAsyncAction VoiceClient::ConnectAsync() {
+        Windows::Foundation::Uri url{ L"wss://" + _webSocketEndpoint.hostname + L"/?encoding=json&v=7" };
+        co_await _webSocket.ConnectAsync(url);
+        _webSocketOpen = true;
+    }
+
     Windows::Foundation::IAsyncAction VoiceClient::SendIdentifyAsync() {
         _heartbeatTimer = ThreadPoolTimer::CreatePeriodicTimer({ this, &VoiceClient::OnWsHeartbeat }, milliseconds(heartbeat_interval));
 
-        auto payload = JsonObject();
+        JsonObject payload{};
         payload.SetNamedValue(L"server_id", JsonValue::CreateStringValue(to_hstring(_voiceOptions.GuildId())));
         payload.SetNamedValue(L"user_id", JsonValue::CreateStringValue(to_hstring(_voiceOptions.CurrentUserId())));
         payload.SetNamedValue(L"session_id", JsonValue::CreateStringValue(_voiceOptions.SessionId()));
         payload.SetNamedValue(L"token", JsonValue::CreateStringValue(_voiceOptions.Token()));
-        payload.SetNamedValue(L"video", JsonValue::CreateBooleanValue(false));
+        payload.SetNamedValue(L"video", JsonValue::CreateBooleanValue(true));
 
-        auto disp = JsonObject();
+        JsonArray streams{};
+        JsonObject stream1{};
+        stream1.SetNamedValue(L"type", JsonValue::CreateStringValue(L"video"));
+        stream1.SetNamedValue(L"rid", JsonValue::CreateStringValue(L"100"));
+        stream1.SetNamedValue(L"quality", JsonValue::CreateNumberValue(100));
+        streams.Append(stream1);
+
+        payload.SetNamedValue(L"streams", streams);
+
+        JsonObject disp{};
         disp.SetNamedValue(L"op", JsonValue::CreateNumberValue(0));
         disp.SetNamedValue(L"d", payload);
+
 
         co_await SendJsonPayloadAsync(disp);
     }
 
     Windows::Foundation::IAsyncAction VoiceClient::Stage1(JsonObject obj) {
         if (obj != nullptr) {
+            _audioSSRC = (uint32_t)obj.GetNamedNumber(L"ssrc");
+            _udpSocketEndpoint = ConnectionEndpoint{};
             _udpSocketEndpoint.hostname = obj.GetNamedString(L"ip");
             _udpSocketEndpoint.port = (uint16_t)obj.GetNamedNumber(L"port");
+
+            auto streams = obj.GetNamedArray(L"streams");
+            for (auto& stream : streams) {
+                auto streamObj = stream.GetObject();
+
+                auto rid = streamObj.GetNamedString(L"rid");
+                auto ssrc = streamObj.GetNamedNumber(L"ssrc");
+                auto rtx_ssrc = streamObj.GetNamedNumber(L"rtx_ssrc");
+                auto type = streamObj.GetNamedString(L"type");
+                auto quality = streamObj.GetNamedNumber(L"quality");
+                auto active = streamObj.GetNamedBoolean(L"active");
+
+                StreamInfo info{};
+                info.ssrc = (uint32_t)ssrc;
+                info.rtx_ssrc = (uint32_t)rtx_ssrc;
+                info.type = to_string(type);
+                info.quality = (uint32_t)quality;
+                info.active = active;
+
+                info.max_resolution = { 640,
+                    360,
+                    "fixed" };
+
+                info.max_bitrate = 2500000;
+                info.max_framerate = 30;
+
+                this->_streamMap[to_string(rid)] = info;
+            }
         }
 
         HostName remoteHost{ _udpSocketEndpoint.hostname };
@@ -167,15 +243,21 @@ namespace winrt::Unicord::Universal::Voice::implementation {
         opus.SetNamedValue(L"priority", JsonValue::CreateNumberValue(1000));
         opus.SetNamedValue(L"payload_type", JsonValue::CreateNumberValue(Rtp::RTP_TYPE_OPUS));
 
-        // JsonObject h264;
-        // h264.SetNamedValue(L"name", JsonValue::CreateStringValue(L"H264"));
-        // h264.SetNamedValue(L"type", JsonValue::CreateStringValue(L"video"));
-        // h264.SetNamedValue(L"priority", JsonValue::CreateNumberValue(1001));
-        // h264.SetNamedValue(L"payload_type", JsonValue::CreateNumberValue(Rtp::RTP_TYPE_H264));
-        // h264.SetNamedValue(L"rtx_payload_type", JsonValue::CreateNumberValue(Rtp::RTP_TYPE_H264_RTX));
+        JsonObject h264;
+#if VP8
+        h264.SetNamedValue(L"name", JsonValue::CreateStringValue(L"VP8"));
+#else
+        h264.SetNamedValue(L"name", JsonValue::CreateStringValue(L"H264"));
+#endif
+        h264.SetNamedValue(L"type", JsonValue::CreateStringValue(L"video"));
+        h264.SetNamedValue(L"priority", JsonValue::CreateNumberValue(1001));
+        h264.SetNamedValue(L"payload_type", JsonValue::CreateNumberValue(Rtp::RTP_TYPE_H264));
+        h264.SetNamedValue(L"rtx_payload_type", JsonValue::CreateNumberValue(Rtp::RTP_TYPE_H264_RTX));
+        h264.SetNamedValue(L"encode", JsonValue::CreateBooleanValue(true));
+        h264.SetNamedValue(L"decode", JsonValue::CreateBooleanValue(true));
 
         JsonArray codecs;
-        // codecs.Append(h264);
+        codecs.Append(h264);
         codecs.Append(opus);
 
         JsonObject protocol_select;
@@ -218,7 +300,6 @@ namespace winrt::Unicord::Universal::Voice::implementation {
     }
 
     // init code taken and tweaked from webrtc itself
-
     void VoiceClient::InitAdm(webrtc::AudioDeviceWasapi* adm) {
         static const webrtc::AudioDeviceModule::WindowsDeviceType AUDIO_DEVICE_ID = webrtc::AudioDeviceModule::WindowsDeviceType::kDefaultDevice;
 
@@ -317,14 +398,43 @@ namespace winrt::Unicord::Universal::Voice::implementation {
         voice_detection->Enable(true);
     }
 
+    void VoiceClient::EnableVideoStreams() {
+        for (auto& stream : _streamMap) {
+            this->_activeVideoSSRC = stream.second.ssrc;
+            this->_activeVideoRtxSSRC = stream.second.rtx_ssrc;
+            _streamMap[stream.first].active = true;
+
+            _webrtcThread->Invoke<void>(RTC_FROM_HERE, [this, stream]() {
+#if VP8
+                auto sendStream = this->CreateVideoSendStream(stream.second.ssrc, stream.second.rtx_ssrc, "VP8", Rtp::RTP_TYPE_H264, Rtp::RTP_TYPE_H264_RTX);
+#else
+                auto sendStream = this->CreateVideoSendStream(stream.second.ssrc, stream.second.rtx_ssrc, "H264", Rtp::RTP_TYPE_H264, Rtp::RTP_TYPE_H264_RTX);
+#endif
+                sendStream->Start();
+
+                _call->SignalChannelNetworkState(webrtc::MediaType::VIDEO, webrtc::NetworkState::kNetworkUp);
+            });
+        }
+
+        SendStreamsUpdateAsync();
+    }
+
     void VoiceClient::StartCall() {
         //rtc::LogMessage::LogToDebug(rtc::LS_WARNING);
 
         this->_audioDecoderFactory = webrtc::CreateBuiltinAudioDecoderFactory();
         this->_audioEncoderFactory = webrtc::CreateBuiltinAudioEncoderFactory();
-        //this->_videoEncoderFactory = std::make_shared<webrtc::WinUWPH264EncoderFactory>();
-        //this->_videoDecoderFactory = std::make_shared<webrtc::WinUWPH264DecoderFactory>();
 
+
+#if VP8
+        this->_videoEncoderFactory = webrtc::CreateBuiltinVideoEncoderFactory();
+        this->_videoDecoderFactory = webrtc::CreateBuiltinVideoDecoderFactory();
+#else
+        auto videoEncoderFactory = std::make_unique<webrtc::WinUWPH264EncoderFactory>();
+        auto videoDecoderFactory = std::make_unique<webrtc::WinUWPH264DecoderFactory>();
+        this->_videoEncoderFactory = cricket::ConvertVideoEncoderFactory(std::move(videoEncoderFactory));
+        this->_videoDecoderFactory = cricket::ConvertVideoDecoderFactory(std::move(videoDecoderFactory));
+#endif
         webrtc::IAudioDeviceWasapi::CreationProperties props = {};
         props.id_ = "Unicord";
         props.playoutEnabled_ = true;
@@ -353,12 +463,15 @@ namespace winrt::Unicord::Universal::Voice::implementation {
         webrtc::Call::Config callConfig{ logger.release() };
         callConfig.audio_state = _audioState;
         callConfig.audio_processing = _audioState->audio_processing();
+        //callConfig.task_queue_factory task_queue_factory
 
         _call = std::unique_ptr<webrtc::Call>{ webrtc::Call::Create(callConfig) };
         _outboundTransport = std::make_unique<VoiceOutboundTransport>(_sodium, _udpWriter);
         _outboundTransport->Start();
 
         _audioSendStream = CreateAudioSendStream(_audioSSRC, Rtp::RTP_TYPE_OPUS);
+        //_videoSendStream = CreateVideoSendStream()
+
         _call->SignalChannelNetworkState(webrtc::MediaType::AUDIO, webrtc::NetworkState::kNetworkUp);
 
         for (auto stream : _audioRecieveStreams) {
@@ -370,6 +483,9 @@ namespace winrt::Unicord::Universal::Voice::implementation {
         }
 
         SendSpeakingAsync(true);
+        SendStreamsUpdateAsync();
+
+        EnableVideoStreams();
     }
 
     webrtc::AudioSendStream* VoiceClient::CreateAudioSendStream(uint32_t ssrc, uint8_t payloadType) {
@@ -400,61 +516,148 @@ namespace winrt::Unicord::Universal::Voice::implementation {
         return audioStream;
     }
 
+    webrtc::VideoSendStream* VoiceClient::CreateVideoSendStream(uint32_t ssrc, uint32_t rtx_ssrc, std::string payloadName, uint8_t payloadType, uint8_t rtxPayloadType) {
+        webrtc::VideoSendStream::Config videoConfig{ this->_outboundTransport.get() };
+        videoConfig.encoder_settings.encoder_factory = this->_videoEncoderFactory.get();
+        // not a thing in this older version of webrtc?
+        // videoConfig.encoder_settings.bitrate_allocator_factory = _bitrateAllocatorFactory.get();
+
+        videoConfig.rtp.rtcp_mode = webrtc::RtcpMode::kReducedSize;
+        videoConfig.rtp.ssrcs.push_back(ssrc);
+        videoConfig.rtp.payload_name = payloadName;
+        videoConfig.rtp.payload_type = payloadType;
+        videoConfig.rtp.rtx.ssrcs.push_back(rtx_ssrc);
+        videoConfig.rtp.rtx.payload_type = rtxPayloadType;
+        videoConfig.send_transport = this->_outboundTransport.get();
+
+        webrtc::VideoEncoderConfig encoderConfig;
+        encoderConfig.content_type = webrtc::VideoEncoderConfig::ContentType::kRealtimeVideo;
+        encoderConfig.codec_type = webrtc::PayloadStringToCodecType(payloadName);
+        encoderConfig.min_transmit_bitrate_bps = 500000;
+        encoderConfig.max_bitrate_bps = 2500000; // 5 Mbps
+        encoderConfig.video_format.name = payloadName;
+
+#if VP8
+        webrtc::VideoCodecVP8 settings = webrtc::VideoEncoder::GetDefaultVp8Settings();
+        encoderConfig.encoder_specific_settings = new rtc::RefCountedObject<webrtc::VideoEncoderConfig::Vp8EncoderSpecificSettings>(settings);
+#else
+        webrtc::VideoCodecH264 settings = webrtc::VideoEncoder::GetDefaultH264Settings();
+        encoderConfig.encoder_specific_settings = new rtc::RefCountedObject<webrtc::VideoEncoderConfig::H264EncoderSpecificSettings>(settings);
+#endif
+        encoderConfig.number_of_streams = 1;
+        encoderConfig.bitrate_priority = 1.0;
+        encoderConfig.simulcast_layers.resize(encoderConfig.number_of_streams);
+        encoderConfig.simulcast_layers[0].active = true;
+        encoderConfig.simulcast_layers[0].min_bitrate_bps = 30000;
+        encoderConfig.simulcast_layers[0].max_bitrate_bps = 2500000;
+        encoderConfig.simulcast_layers[0].max_framerate = 30;
+
+        encoderConfig.video_stream_factory = new rtc::RefCountedObject<cricket::EncoderStreamFactory>(
+            videoConfig.rtp.payload_name, 56, false, false);
+
+        webrtc::test::FrameGeneratorCapturer* frame_generator =
+            webrtc::test::FrameGeneratorCapturer::Create(320, 180, absl::nullopt, 5, 15, webrtc::Clock::GetRealTimeClock());
+
+
+        //QuickVideoCapturer* capturer = new QuickVideoCapturer();
+
+        webrtc::VideoSendStream* videoSendStream = this->_call->CreateVideoSendStream(std::move(videoConfig), std::move(encoderConfig));
+        videoSendStream->SetSource(frame_generator, webrtc::DegradationPreference::MAINTAIN_FRAMERATE);
+        videoSendStream->Start();
+
+        frame_generator->Start();
+        //capturer->_videoCaptureModule->StartCapture(webrtc::VideoCaptureCapability::)
+
+        return videoSendStream;
+    }
+
     void VoiceClient::ProcessRawPacket(array_view<uint8_t> data) {
         uint8_t nonce[24] = { 0 };
 
         bool isRtcp = webrtc::RtpHeaderParser::IsRtcp(data.data(), data.size());
+        uint8_t* decrypted = new uint8_t[data.size() - 16];
+        if (isRtcp) {
+            memcpy(nonce, data.data(), 8);
+            memcpy(decrypted, data.data(), 8);
+            crypto_secretbox_open_easy(decrypted + 8, data.data() + 8, data.size() - 8, nonce, _sodium->Key());
 
-        webrtc::MediaType type = webrtc::MediaType::ANY;
-        size_t headerSize = isRtcp ? 8 : 12;
+            _webrtcThread->Invoke<void>(RTC_FROM_HERE, [this, decrypted, data]() {
+                _call->Receiver()->DeliverPacket(webrtc::MediaType::ANY, rtc::CopyOnWriteBuffer(decrypted, data.size() - 16), rtc::TimeMicros());
+                delete decrypted;
+            });
+        }
+        else {
+            memcpy(nonce, data.data(), 12);
+            memcpy(decrypted, data.data(), 12); // Todo: resolve potential buffer overrun
 
-        if (!isRtcp) { // this probably isn't the most efficient but hey
+            crypto_secretbox_open_easy(decrypted + 12, data.data() + 12, data.size() - 12, nonce, _sodium->Key());
+
+            webrtc::RTPHeader header;
+
             std::unique_ptr<webrtc::RtpHeaderParser> parser{ webrtc::RtpHeaderParser::Create() };
-
-            webrtc::RTPHeader header = {};
             parser->Parse(data.data(), data.size(), &header);
 
-            if (header.payloadType == Rtp::RTP_TYPE_OPUS) {
-                type = webrtc::MediaType::AUDIO;
-            }
+            webrtc::MediaType type = header.payloadType == 100 || header.payloadType == 101 || header.payloadType == 102
+                                         ? webrtc::MediaType::VIDEO
+                                         : webrtc::MediaType::AUDIO;
 
-            if (header.payloadType == Rtp::RTP_TYPE_H264 || header.payloadType == Rtp::RTP_TYPE_H264_RTX) {
-                type = webrtc::MediaType::VIDEO;
-            }
+
+            _webrtcThread->Invoke<void>(RTC_FROM_HERE, [this, decrypted, data, type]() {
+                _call->Receiver()->DeliverPacket(type, rtc::CopyOnWriteBuffer(decrypted, data.size() - 16), rtc::TimeMicros());
+                delete decrypted;
+            });
         }
 
-        size_t decryptedSize = _sodium->CalculateTargetSize(data.size());
-        uint8_t* decrypted = new uint8_t[decryptedSize];
+        //webrtc::MediaType type = webrtc::MediaType::ANY;
+        //size_t headerSize = isRtcp ? 8 : 12;
 
-        // copy header to the decrypted data
-        std::copy(data.begin(), data.begin() + headerSize, decrypted);
+        //if (!isRtcp) { // this probably isn't the most efficient but hey
+        //    std::unique_ptr<webrtc::RtpHeaderParser> parser{ webrtc::RtpHeaderParser::Create() };
 
-        gsl::span<uint8_t> encryptedData;
-        switch (_sodium->GetCurrentEncryptionMode()) {
-        case XSalsa20_Poly1305:
-            encryptedData = gsl::make_span(data.begin() + headerSize, data.end());
-            break;
-        case XSalsa20_Poly1305_Suffix:
-            encryptedData = gsl::make_span(data.begin() + headerSize, data.end() - crypto_secretbox_xsalsa20poly1305_NONCEBYTES);
-            break;
-        case XSalsa20_Poly1305_Lite:
-            encryptedData = gsl::make_span(data.begin() + headerSize, data.end() - 4);
-            break;
-        default:
-            throw hresult_invalid_argument();
-        }
+        //    webrtc::RTPHeader header = {};
+        //    parser->Parse(data.data(), data.size(), &header);
 
-        _sodium->GetNonce(data, nonce, isRtcp);
-        _sodium->Decrypt(encryptedData, nonce, gsl::make_span(decrypted, decryptedSize).subspan(headerSize));
+        //    if (header.payloadType == Rtp::RTP_TYPE_OPUS) {
+        //        type = webrtc::MediaType::AUDIO;
+        //    }
 
-        _webrtcThread->Invoke<void>(RTC_FROM_HERE, [this, decrypted, decryptedSize, type]() {
-            rtc::PacketTime pTime = rtc::CreatePacketTime(0);
+        //    if (header.payloadType == Rtp::RTP_TYPE_H264 || header.payloadType == Rtp::RTP_TYPE_H264_RTX) {
+        //        type = webrtc::MediaType::VIDEO;
+        //    }
+        //}
 
-            if (_call)
-                _call->Receiver()->DeliverPacket(type, rtc::CopyOnWriteBuffer(decrypted, decryptedSize), pTime.timestamp);
+        //size_t decryptedSize = _sodium->CalculateTargetSize(data.size());
+        //uint8_t* decrypted = new uint8_t[decryptedSize];
 
-            delete decrypted;
-        });
+        //// copy header to the decrypted data
+        //std::copy(data.begin(), data.begin() + headerSize, decrypted);
+
+        //gsl::span<uint8_t> encryptedData;
+        //switch (_sodium->GetCurrentEncryptionMode()) {
+        //case XSalsa20_Poly1305:
+        //    encryptedData = gsl::make_span(data.begin() + headerSize, data.end());
+        //    break;
+        //case XSalsa20_Poly1305_Suffix:
+        //    encryptedData = gsl::make_span(data.begin() + headerSize, data.end() - crypto_secretbox_xsalsa20poly1305_NONCEBYTES);
+        //    break;
+        //case XSalsa20_Poly1305_Lite:
+        //    encryptedData = gsl::make_span(data.begin() + headerSize, data.end() - 4);
+        //    break;
+        //default:
+        //    throw hresult_invalid_argument();
+        //}
+
+        //_sodium->GetNonce(data, nonce, isRtcp);
+        //_sodium->Decrypt(encryptedData, nonce, gsl::make_span(decrypted, decryptedSize).subspan(headerSize));
+
+        //_webrtcThread->Invoke<void>(RTC_FROM_HERE, [this, decrypted, decryptedSize, type]() {
+        //    rtc::PacketTime pTime = rtc::CreatePacketTime(0);
+
+        //    if (_call)
+        //        _call->Receiver()->DeliverPacket(type, rtc::CopyOnWriteBuffer(decrypted, decryptedSize), pTime.timestamp);
+
+        //    delete decrypted;
+        //});
     }
 
     Windows::Foundation::IAsyncAction VoiceClient::OnWsHeartbeat(ThreadPoolTimer timer) {
@@ -494,10 +697,6 @@ namespace winrt::Unicord::Universal::Voice::implementation {
                     co_await SendIdentifyAsync();
                     break;
                 case 2: // ready
-                    _audioSSRC = (uint32_t)data.GetNamedNumber(L"ssrc");
-                    _udpSocketEndpoint = ConnectionEndpoint{};
-                    _udpSocketEndpoint.hostname = data.GetNamedString(L"ip");
-                    _udpSocketEndpoint.port = (uint16_t)data.GetNamedNumber(L"port");
                     co_await Stage1(data);
                     break;
                 case 4: // session description
@@ -545,39 +744,39 @@ namespace winrt::Unicord::Universal::Voice::implementation {
                     else {
                         // has video
 
-                        auto stream = _videoRecieveStreams.find(video_ssrc);
-                        if (stream == _videoRecieveStreams.end()) {
-                            webrtc::VideoReceiveStream* recieveStream = nullptr;
-                            if (_call != nullptr) {
-                                recieveStream = _webrtcThread->Invoke<webrtc::VideoReceiveStream*>(RTC_FROM_HERE, [this, video_ssrc, rtx_ssrc]() {
-                                    webrtc::VideoReceiveStream::Config videoConfig{ this->_outboundTransport.get() };
-                                    videoConfig.rtp.remote_ssrc = video_ssrc;
-                                    videoConfig.rtp.rtx_ssrc = rtx_ssrc;
-                                    videoConfig.rtp.local_ssrc = rtx_ssrc;
-                                    videoConfig.rtp.rtx_associated_payload_types.insert(std::make_pair(Rtp::RTP_TYPE_H264_RTX, Rtp::RTP_TYPE_H264));
+                        //auto stream = _videoRecieveStreams.find(video_ssrc);
+                        //if (stream == _videoRecieveStreams.end()) {
+                        //    webrtc::VideoReceiveStream* recieveStream = nullptr;
+                        //    if (_call != nullptr) {
+                        //        recieveStream = _webrtcThread->Invoke<webrtc::VideoReceiveStream*>(RTC_FROM_HERE, [this, video_ssrc, rtx_ssrc]() {
+                        //            //webrtc::VideoReceiveStream::Config videoConfig{ this->_outboundTransport.get() };
+                        //            //videoConfig.rtp.remote_ssrc = video_ssrc;
+                        //            //videoConfig.rtp.rtx_ssrc = rtx_ssrc;
+                        //            //videoConfig.rtp.local_ssrc = rtx_ssrc;
+                        //            //videoConfig.rtp.rtx_associated_payload_types.insert(std::make_pair(Rtp::RTP_TYPE_H264_RTX, Rtp::RTP_TYPE_H264));
 
-                                    videoConfig.renderer = new Render::VideoFrameSink(video_ssrc);
+                        //            //videoConfig.renderer = new Render::VideoFrameSink(video_ssrc);
 
-                                    cricket::VideoDecoderParams params;
-                                    params.receive_stream_id = std::to_string(video_ssrc);
-                                    webrtc::VideoDecoder* decoder = _videoDecoderFactory->CreateVideoDecoderWithParams(webrtc::VideoCodecType::kVideoCodecH264, params);
-                                    webrtc::VideoReceiveStream::Decoder recieveDecoder;
-                                    recieveDecoder.decoder = decoder;
-                                    recieveDecoder.payload_type = Rtp::RTP_TYPE_H264;
-                                    //recieveDecoder.video_format.
+                        //            //cricket::VideoDecoderParams params;
+                        //            //params.receive_stream_id = std::to_string(video_ssrc);
+                        //            //webrtc::VideoDecoder* decoder = _videoDecoderFactory->CreateVideoDecoderWithParams(webrtc::VideoCodecType::kVideoCodecH264, params);
+                        //            //webrtc::VideoReceiveStream::Decoder recieveDecoder;
+                        //            //recieveDecoder.decoder = decoder;
+                        //            //recieveDecoder.payload_type = Rtp::RTP_TYPE_H264;
+                        //            ////recieveDecoder.video_format.
 
-                                    videoConfig.decoders.push_back(recieveDecoder);
+                        //            //videoConfig.decoders.push_back(recieveDecoder);
 
-                                    webrtc::VideoReceiveStream* stream = _call->CreateVideoReceiveStream(videoConfig.Copy());
-                                    stream->Start();
+                        //            //webrtc::VideoReceiveStream* stream = _call->CreateVideoReceiveStream(videoConfig.Copy());
+                        //            //stream->Start();
 
-                                    return stream;
-                                });
-                            }
+                        //            //return stream;
+                        //        });
+                        //    }
 
 
-                            this->_videoRecieveStreams[video_ssrc] = recieveStream;
-                        }
+                        //    this->_videoRecieveStreams[video_ssrc] = recieveStream;
+                        //}
                     }
 
                     break;
@@ -685,9 +884,49 @@ namespace winrt::Unicord::Universal::Voice::implementation {
         JsonObject payload;
         payload.SetNamedValue(L"speaking", JsonValue::CreateBooleanValue(speaking));
         payload.SetNamedValue(L"delay", JsonValue::CreateNumberValue(0));
+        payload.SetNamedValue(L"ssrc", JsonValue::CreateNumberValue(_audioSSRC));
 
         JsonObject disp;
         disp.SetNamedValue(L"op", JsonValue::CreateNumberValue(5));
+        disp.SetNamedValue(L"d", payload);
+
+        co_await SendJsonPayloadAsync(disp);
+    }
+
+    Windows::Foundation::IAsyncAction VoiceClient::SendStreamsUpdateAsync() {
+        JsonObject payload;
+        payload.SetNamedValue(L"audio_ssrc", JsonValue::CreateNumberValue(_audioSSRC));
+        payload.SetNamedValue(L"video_ssrc", JsonValue::CreateNumberValue(_activeVideoSSRC));
+        payload.SetNamedValue(L"rtx_ssrc", JsonValue::CreateNumberValue(_activeVideoRtxSSRC));
+
+        JsonArray streams;
+
+        for (auto& stream : _streamMap) {
+            JsonObject jStream;
+            jStream.SetNamedValue(L"type", JsonValue::CreateStringValue(to_hstring(stream.second.type)));
+            jStream.SetNamedValue(L"rid", JsonValue::CreateStringValue(to_hstring(stream.first)));
+            jStream.SetNamedValue(L"ssrc", JsonValue::CreateNumberValue(stream.second.ssrc));
+            jStream.SetNamedValue(L"active", JsonValue::CreateBooleanValue(stream.second.active));
+            jStream.SetNamedValue(L"quality", JsonValue::CreateNumberValue(stream.second.quality));
+            jStream.SetNamedValue(L"rtx_ssrc", JsonValue::CreateNumberValue(stream.second.rtx_ssrc));
+
+            jStream.SetNamedValue(L"max_bitrate", JsonValue::CreateNumberValue(stream.second.max_bitrate));
+            jStream.SetNamedValue(L"max_framerate", JsonValue::CreateNumberValue(stream.second.max_framerate));
+
+            JsonObject max_resolution;
+            max_resolution.SetNamedValue(L"width", JsonValue::CreateNumberValue(stream.second.max_resolution.width));
+            max_resolution.SetNamedValue(L"height", JsonValue::CreateNumberValue(stream.second.max_resolution.height));
+            max_resolution.SetNamedValue(L"type", JsonValue::CreateStringValue(to_hstring(stream.second.max_resolution.type)));
+
+            jStream.SetNamedValue(L"max_resolution", max_resolution);
+
+            streams.Append(jStream);
+        }
+
+        payload.SetNamedValue(L"streams", streams);
+
+        JsonObject disp;
+        disp.SetNamedValue(L"op", JsonValue::CreateNumberValue(12));
         disp.SetNamedValue(L"d", payload);
 
         co_await SendJsonPayloadAsync(disp);
@@ -732,7 +971,7 @@ namespace winrt::Unicord::Universal::Voice::implementation {
 
     void VoiceClient::HandleUdpHeartbeat(uint64_t count) {
         uint64_t now = duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
-        std::wcout << L"↓ Got UDP Heartbeat " << count << L"!\n";
+        std::cout << "↓ Got UDP Heartbeat " << count << "!\n";
 
         auto itr = keepalive_timestamps.find(count);
         if (itr != keepalive_timestamps.end()) {
@@ -759,6 +998,7 @@ namespace winrt::Unicord::Universal::Voice::implementation {
             uint16_t port = *(uint16_t*)&buff[68];
 
             co_await Stage2(ip, port);
+            co_await SendStreamsUpdateAsync();
         }
         else {
             auto len = reader.UnconsumedBufferLength();
@@ -784,7 +1024,7 @@ namespace winrt::Unicord::Universal::Voice::implementation {
         DataWriter writer{ _webSocket.OutputStream() };
         auto str = payload.Stringify();
 
-        std::wcout << L"↑ " << to_hstring(str).c_str() << L"\n";
+        std::cout << "< " << to_string(str) << std::endl;
 
         writer.WriteString(str);
         co_await writer.StoreAsync();

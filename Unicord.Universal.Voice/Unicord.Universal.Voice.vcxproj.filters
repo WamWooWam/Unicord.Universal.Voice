@@ -24,6 +24,16 @@
     <ClCompile Include="VoiceClientStats.cpp" />
     <ClCompile Include="VideoFrameSink.cpp" />
     <ClCompile Include="SpeakingAudioAnalyzer.cpp" />
+    <ClCompile Include="..\externals\webrtc-uwp-sdk\webrtc\xplatform\webrtc\test\test_video_capturer.cc">
+      <Filter>Externals</Filter>
+    </ClCompile>
+    <ClCompile Include="..\externals\webrtc-uwp-sdk\webrtc\xplatform\webrtc\test\frame_generator.cc">
+      <Filter>Externals</Filter>
+    </ClCompile>
+    <ClCompile Include="..\externals\webrtc-uwp-sdk\webrtc\xplatform\webrtc\test\frame_generator_capturer.cc">
+      <Filter>Externals</Filter>
+    </ClCompile>
+    <ClCompile Include="VideoSurfaceCreatedEventArgs.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="pch.h" />
@@ -60,6 +70,7 @@
     <ClInclude Include="VoiceClientStats.h" />
     <ClInclude Include="VideoFrameSink.h" />
     <ClInclude Include="SpeakingAudioAnalyzer.h" />
+    <ClInclude Include="VideoSurfaceCreatedEventArgs.h" />
   </ItemGroup>
   <ItemGroup>
     <Midl Include="VoiceClient.idl" />
@@ -78,6 +89,7 @@
     </Midl>
     <Midl Include="VoiceClientStats.idl" />
     <Midl Include="NoiseSuppressionLevel.idl" />
+    <Midl Include="VideoSurfaceCreatedEventArgs.idl" />
   </ItemGroup>
   <ItemGroup>
     <None Include="Unicord.Universal.Voice.def" />

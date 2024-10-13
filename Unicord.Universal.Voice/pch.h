@@ -1,7 +1,6 @@
 ﻿#pragma once
 #define NOMINMAX
 #define WEBRTC_WIN
-#define ABSL_USES_STD_STRING_VIEW
 
 #include <unknwn.h>
 #include <ppltasks.h>
